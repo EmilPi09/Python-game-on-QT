@@ -5,10 +5,9 @@
 ---
 
 ## 📸 Скриншоты и Визуализация
+<img width="1911" height="1070" alt="image" src="https://github.com/user-attachments/assets/0e2b4d78-7ee1-4854-825e-342e9cdc93a7" />
+<img width="1886" height="1038" alt="image" src="https://github.com/user-attachments/assets/47e7962a-ad62-4338-8b23-2ca32aec65b9" />
 
-| Главное меню | Игровой процесс (Бой) |
-| :---: | :---: |
-| ![Menu Placeholder](https://img.shields.io/badge/Interface-MainMenu-blueviolet?style=for-the-badge) | ![Gameplay Placeholder](https://img.shields.io/badge/Gameplay-SpaceBattle-deepskyblue?style=for-the-badge) |
 
 ---
 
