@@ -1,0 +1,1216 @@
+"""
+Управление:
+  P1 (синий):  WASD — поворот/тяга   Пробел — выстрел
+  P2 / BOT:   Стрелки — поворот/тяга  Enter — выстрел
+  R — перезапуск M — меню   Esc — выход
+
+
+Пауэрапы (подбираются пролётом над ними):
+  💛 Тройной выстрел   🔵 Рассеянный (×5)   ❤ +1 HP
+  🟣 Спаренная пушка   🟢 Щит 3 сек         🟠 Ускорение тяги
+  ⭐ Снаряд-пробойник  🔴 Ракета (самонаводка)
+"""
+
+import sys, math, random
+from PyQt5.QtWidgets import QApplication, QWidget, QInputDialog
+from PyQt5.QtCore    import Qt, QTimer, QPointF
+from PyQt5.QtGui     import (QPainter, QColor, QFont, QPen, QBrush,
+                              QPolygonF, QRadialGradient, QLinearGradient)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЭКРАННАЯ АДАПТАЦИЯ  — всё через scale(x) / fs(n)
+# ══════════════════════════════════════════════════════════════════════════════
+_app_ref = QApplication.instance() or QApplication(sys.argv)
+_screen  = _app_ref.primaryScreen().geometry()
+SW, SH   = _screen.width(), _screen.height()
+
+W = max(800,  min(1920, int(SW )))
+REFERENCE_W = 1920
+SC = W / REFERENCE_W
+H = max(560,  min(1080, int(SH)))
+SX = W / 1024
+SY = H / 720
+S  = min(SX, SY)
+
+def sx(v):  return int(v * SX)
+def sy(v):  return int(v * SY)
+def sv(v):  return int(v * S)
+
+_FS = min(S, 1.0)
+def fs(n):  return max(7, int(n * _FS))
+
+# количество планет зависит от площади экрана
+PLANET_COUNT = 5 + max(0, (W - 1024) // 300)
+
+SCORES_FILE = "gw_scores.json"
+
+# Физика: скорости в пикселях/сек — масштабируем пропорционально экрану
+# G масштабируем по S^2, т.к. расстояния тоже масштабируются
+G          = 6500.0 * S * S
+BULLET_SPD = 340.0 * S
+MAX_SPD    = 320.0 * S
+THRUST     = 195.0 * S
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ПРОФИЛИ СЛОЖНОСТИ
+# ══════════════════════════════════════════════════════════════════════════════
+DIFFICULTY = {
+    # поворот, ошибка прицела, интервал стрельбы мин/макс,
+    # шагов симуляции, порог уклонения, вер. тяги
+    "Новобранец": dict(
+        turn_rate   = 1.4,
+        aim_error   = 0.85,
+        shoot_min   = 1.8, shoot_max = 4.5,
+        sim_steps   = 15,
+        evade_dist  = 70,
+        thrust_p    = 0.35,
+        react_t     = 0.8,    # пересчёт прицела
+        label_color = QColor(100, 200, 100),
+    ),
+    "Опытный": dict(
+        turn_rate   = 2.5,
+        aim_error   = 0.30,
+        shoot_min   = 0.9, shoot_max = 2.2,
+        sim_steps   = 38,
+        evade_dist  = 120,
+        thrust_p    = 0.65,
+        react_t     = 0.35,
+        label_color = QColor(255, 180, 60),
+    ),
+    "Мастер": dict(
+        turn_rate   = 3.8,
+        aim_error   = 0.05,
+        shoot_min   = 0.4, shoot_max = 1.1,
+        sim_steps   = 55,
+        evade_dist  = 155,
+        thrust_p    = 0.85,
+        react_t     = 0.25,
+        label_color = QColor(255, 60, 60),
+    ),
+}
+DIFF_NAMES = list(DIFFICULTY.keys())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ПЛАНЕТА
+# ══════════════════════════════════════════════════════════════════════════════
+class Planet:
+    def __init__(self, x, y, r, mass, color):
+        self.x, self.y = x, y
+        self.r, self.mass = r, mass
+        self.color    = color
+        self.angle    = random.uniform(0, math.pi*2)
+        self.spin     = random.uniform(-0.25, 0.25)
+        self.has_ring = r > sv(45)
+
+    def update(self, dt): self.angle += self.spin * dt
+
+    def draw(self, p):
+        r = self.r; cx, cy = int(self.x), int(self.y)
+        glow = int(14 + self.mass * 8)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(self.color.red(), self.color.green(),
+                                  self.color.blue(), 16)))
+        p.drawEllipse(cx-r-glow, cy-r-glow, (r+glow)*2, (r+glow)*2)
+        # 3-D тело
+        grad = QRadialGradient(cx - r*0.35, cy - r*0.35, r*1.25)
+        grad.setColorAt(0.0, self.color.lighter(200))
+        grad.setColorAt(0.45, self.color)
+        grad.setColorAt(1.0, self.color.darker(240))
+        p.setBrush(QBrush(grad))
+        p.setPen(QPen(self.color.lighter(130), 0.5))
+        p.drawEllipse(cx-r, cy-r, r*2, r*2)
+        # полосы
+        p.setPen(QPen(QColor(255,255,255,18), sv(1)))
+        p.setBrush(Qt.NoBrush)
+        for i in range(1, 3):
+            ry = int(r * 0.33 * i)
+            p.drawEllipse(cx-r+sv(5), cy-ry, (r-sv(5))*2, ry*2)
+        # кольцо тяготения — толщина = масса, цвет красноватый у тяжёлых
+        ring_w = max(1, int(self.mass * 3.5))
+        ring_alpha = min(130, int(self.mass * 70))
+        rc = self.color if self.mass < 1.0 else QColor(
+            min(255, self.color.red() + int(self.mass*40)),
+            max(0,   self.color.green() - int(self.mass*20)),
+            max(0,   self.color.blue()  - int(self.mass*20))
+        )
+        p.setPen(QPen(QColor(rc.red(), rc.green(), rc.blue(), ring_alpha), ring_w))
+        p.setBrush(Qt.NoBrush)
+        off = sv(10) + ring_w
+        p.drawEllipse(cx-r-off, cy-r-off, (r+off)*2, (r+off)*2)
+        # метка массы (маленькая, у большой планеты)
+        if self.mass >= 1.3:
+            p.setFont(QFont("Arial", fs(8), QFont.Bold))
+            p.setPen(QColor(255, 160, 60, 160))
+            p.drawText(cx - sv(8), cy + sv(4), "G")
+        # кольцо (декоративное, у крупных)
+        if self.has_ring:
+            p.setPen(QPen(QColor(self.color.red(), self.color.green(),
+                                  self.color.blue(), 55), sv(5)))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(cx-r-sv(20), cy-sv(10), (r+sv(20))*2, sv(22))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  СНАРЯД
+# ══════════════════════════════════════════════════════════════════════════════
+class Bullet:
+    def __init__(self, x, y, vx, vy, owner_id, piercing=False):
+        self.x, self.y   = x, y
+        self.vx, self.vy = vx, vy
+        self.owner        = owner_id
+        self.trail        = []
+        self.alive        = True
+        self.age          = 0.0
+        self.piercing     = piercing
+
+    def update(self, planets, dt):
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 28: self.trail.pop(0)
+        for pl in planets:
+            dx = pl.x - self.x; dy = pl.y - self.y
+            dist = max(math.hypot(dx, dy), pl.r + 4)
+            f = G/6 * pl.mass / (dist*dist)
+            self.vx += dx/dist * f * dt
+            self.vy += dy/dist * f * dt
+            if dist < pl.r + 4: self.alive = False
+        self.x += self.vx*dt; self.y += self.vy*dt
+        self.age += dt
+        if self.age > 7 or not (-80<self.x<W+80 and -80<self.y<H+80):
+            self.alive = False
+
+    def draw(self, p, color):
+        for i, (tx, ty) in enumerate(self.trail):
+            a = int(200 * i / max(len(self.trail), 1))
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), a),
+                          max(1, i//6)))
+            p.drawPoint(int(tx), int(ty))
+        # пробойник — золотой
+        c = QColor(255, 220, 60) if self.piercing else color
+        p.setBrush(QBrush(c)); p.setPen(Qt.NoPen)
+        r = sv(5)
+        p.drawEllipse(int(self.x-r), int(self.y-r), r*2, r*2)
+        p.setBrush(QBrush(c.lighter(200)))
+        p.drawEllipse(int(self.x-r//2), int(self.y-r//2), r, r)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  РАКЕТА  (самонаводка на ближайшего врага)
+# ══════════════════════════════════════════════════════════════════════════════
+class Rocket:
+    def __init__(self, x, y, vx, vy, owner_id):
+        self.x, self.y   = x, y
+        self.vx, self.vy = vx, vy
+        self.owner        = owner_id
+        self.alive        = True
+        self.age          = 0.0
+        self.trail        = []
+        self.turn_rate    = 2.5
+
+    def update(self, planets, target, dt):
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 20: self.trail.pop(0)
+
+        # самонаводка
+        if target and target.invincible <= 0:
+            dx = target.x - self.x; dy = target.y - self.y
+            desired = math.atan2(dy, dx)
+            cur     = math.atan2(self.vy, self.vx)
+            diff    = (desired - cur + math.pi) % (2*math.pi) - math.pi
+            cur    += max(-self.turn_rate*dt, min(self.turn_rate*dt, diff))
+            spd     = math.hypot(self.vx, self.vy) or sv(300)
+            self.vx = math.cos(cur) * spd
+            self.vy = math.sin(cur) * spd
+
+        # гравитация
+        for pl in planets:
+            dx = pl.x-self.x; dy = pl.y-self.y
+            dist = max(math.hypot(dx, dy), pl.r+4)
+            f = G * pl.mass / (dist*dist)
+            self.vx += dx/dist*f*dt; self.vy += dy/dist*f*dt
+            if dist < pl.r+4: self.alive = False
+
+        self.x += self.vx*dt; self.y += self.vy*dt
+        self.age += dt
+        if self.age > 8 or not (-80<self.x<W+80 and -80<self.y<H+80):
+            self.alive = False
+
+    def draw(self, p):
+        for i, (tx, ty) in enumerate(self.trail):
+            a = int(180 * i / max(len(self.trail), 1))
+            p.setPen(QPen(QColor(255, 80, 30, a), max(1, i//4)))
+            p.drawPoint(int(tx), int(ty))
+        p.setBrush(QBrush(QColor(255, 60, 20))); p.setPen(Qt.NoPen)
+        r = sv(6)
+        p.drawEllipse(int(self.x-r), int(self.y-r), r*2, r*2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  АСТЕРОИД
+# ══════════════════════════════════════════════════════════════════════════════
+class Asteroid:
+    def __init__(self, wave):
+        side = random.randint(0,3); m = sv(50)
+        if   side==0: self.x,self.y = random.uniform(0,W), -m
+        elif side==1: self.x,self.y = W+m, random.uniform(0,H)
+        elif side==2: self.x,self.y = random.uniform(0,W), H+m
+        else:         self.x,self.y = -m, random.uniform(0,H)
+        cx = W/2 + random.uniform(-sx(200), sx(200))
+        cy = H/2 + random.uniform(-sy(140), sy(140))
+        d = math.hypot(cx-self.x, cy-self.y) or 1
+        spd = random.uniform(sv(85)+wave*sv(14), sv(130)+wave*sv(18)) *SC
+        self.vx = (cx-self.x)/d*spd; self.vy = (cy-self.y)/d*spd
+        self.r     = random.uniform(sv(13), sv(22)+wave*sv(2)) * SC
+        self.mass  = self.r * 0.04
+        self.angle = random.uniform(0, math.pi*2)
+        self.spin  = random.uniform(-1.4, 1.4)
+        self.hp    = max(1, int(self.r / sv(8)))
+        self.alive = True
+        self.color = QColor(random.randint(100,155), random.randint(90,145),
+                            random.randint(70,120))
+        n = random.randint(9, 13)
+        self.shape = [(math.cos(i/n*math.pi*2)*self.r*random.uniform(0.65,1.0),
+                       math.sin(i/n*math.pi*2)*self.r*random.uniform(0.65,1.0))
+                      for i in range(n)]
+
+    def update(self, planets, dt):
+        for pl in planets:
+            dx=pl.x-self.x; dy=pl.y-self.y
+            raw_dist = math.hypot(dx, dy)
+            if raw_dist < pl.r + self.r:        # настоящая проверка столкновения
+                self.alive = False
+                break
+            dist = max(raw_dist, pl.r + self.r) # зажатое расстояние только для физики
+            f=G*pl.mass*0.00008*(SC*SC)/(dist*dist)
+            self.vx+=dx/dist*f; self.vy+=dy/dist*f
+        self.x+=self.vx*dt; self.y+=self.vy*dt; self.angle+=self.spin*dt
+        margin = 200 * SC
+        if not (-margin < self.x < W + margin and -margin < self.y < H + margin):
+            self.alive = False
+
+    def draw(self, p):
+        p.save(); p.translate(int(self.x),int(self.y)); p.rotate(math.degrees(self.angle))
+        c = self.color
+        poly = QPolygonF([QPointF(x,y) for x,y in self.shape])
+        grad = QRadialGradient(-self.r*0.3,-self.r*0.3,self.r*1.1)
+        grad.setColorAt(0,c.lighter(160)); grad.setColorAt(0.5,c); grad.setColorAt(1,c.darker(200))
+        p.setBrush(QBrush(grad)); p.setPen(QPen(c.lighter(130),1)); p.drawPolygon(poly)
+        p.setPen(QPen(c.darker(150),1)); p.setBrush(Qt.NoBrush)
+        r=int(self.r*0.3); p.drawEllipse(-r,-r//2,r*2,int(r*1.2))
+        p.restore()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ПАУЭРАП
+# ══════════════════════════════════════════════════════════════════════════════
+# тип: name, icon, color, weight
+POWERUP_TYPES = [
+    ("triple",   "💛", QColor(255,220,60),  30),   # тройной выстрел
+    ("scatter",  "🔵", QColor(60,160,255),  15),   # рассеянный ×5
+    ("hp",       "❤",  QColor(255,80,80),   22),   # +1 HP
+    ("twin",     "🟣", QColor(180,80,255),  18),   # спаренная пушка 5с
+    ("shield",   "🟢", QColor(60,220,120),   8),   # щит 3с
+    ("thrust",   "🟠", QColor(255,140,30),  12),   # ускорение тяги 5с
+    ("piercer",  "⭐", QColor(255,240,100),  8),   # пробойник (1 снаряд)
+    ("rocket",   "🔴", QColor(255,60,20),    7),   # ракета-самонаводка
+]
+_PU_WEIGHTS = [t[3] for t in POWERUP_TYPES]
+_PU_TOTAL   = sum(_PU_WEIGHTS)
+
+def _random_pu_type():
+    r = random.uniform(0, _PU_TOTAL)
+    acc = 0
+    for name, icon, color, w in POWERUP_TYPES:
+        acc += w
+        if r <= acc:
+            return name, icon, color
+    return POWERUP_TYPES[0][:3]
+
+class Powerup:
+    LIFETIME = 12.0   # секунд до исчезновения
+
+    def __init__(self, planets):
+        # спавн — не слишком близко к планетам
+        for _ in range(30):
+            self.x = random.uniform(sx(60), W-sx(60))
+            self.y = random.uniform(sy(60), H-sy(60))
+            if all(math.hypot(self.x-pl.x, self.y-pl.y) > pl.r+sv(40)
+                   for pl in planets):
+                break
+        self.type, self.icon, self.color = _random_pu_type()
+        self.life  = self.LIFETIME
+        self.pulse = random.uniform(0, math.pi*2)
+        self.r     = sv(18)
+        self.alive = True
+
+    def update(self, dt):
+        self.life  -= dt
+        self.pulse += dt * 3.5
+        if self.life <= 0:
+            self.alive = False
+
+    def draw(self, p):
+        t     = self.life / self.LIFETIME
+        alpha = int(min(255, t * 300))    # мигает под конец
+        if self.life < 3 and int(self.life * 6) % 2 == 0:
+            alpha = max(60, alpha)
+        cx, cy = int(self.x), int(self.y)
+        bob    = math.sin(self.pulse) * sv(4)
+        cy    += int(bob)
+        r      = self.r
+
+        # внешнее кольцо
+        p.setPen(QPen(QColor(self.color.red(), self.color.green(),
+                              self.color.blue(), alpha), sv(2)))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(cx-r-sv(5), cy-r-sv(5), (r+sv(5))*2, (r+sv(5))*2)
+
+        # тело
+        grad = QRadialGradient(cx-r*0.3, cy-r*0.3, r*1.1)
+        grad.setColorAt(0, self.color.lighter(180))
+        grad.setColorAt(0.5, self.color)
+        grad.setColorAt(1, self.color.darker(200))
+        p.setBrush(QBrush(grad)); p.setPen(Qt.NoPen)
+        p.drawEllipse(cx-r, cy-r, r*2, r*2)
+
+        # иконка
+        p.setFont(QFont("Arial", fs(13)))
+        p.setPen(QColor(255,255,255,alpha))
+        p.drawText(cx - r + sv(2), cy + sv(6), self.icon)
+
+        # таймер-дуга
+        span = int(360 * 16 * self.life / self.LIFETIME)
+        p.setPen(QPen(QColor(255,255,255,80), sv(2)))
+        p.setBrush(Qt.NoBrush)
+        from PyQt5.QtCore import QRect as _QRect
+        p.drawArc(_QRect(cx-r-sv(7), cy-r-sv(7), (r+sv(7))*2, (r+sv(7))*2),
+                  90*16, -span)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  АКТИВНЫЙ ЭФФЕКТ  (отображается над кораблём)
+# ══════════════════════════════════════════════════════════════════════════════
+class ActiveEffect:
+    def __init__(self, name, duration, icon, color):
+        self.name     = name
+        self.time_left= duration
+        self.max_time = duration
+        self.icon     = icon
+        self.color    = color
+        self.active   = True
+
+    def update(self, dt):
+        self.time_left -= dt
+        if self.time_left <= 0:
+            self.active = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  КОРАБЛЬ
+# ══════════════════════════════════════════════════════════════════════════════
+class Ship:
+    def __init__(self, x, y, color, angle, name="P"):
+        self.x, self.y   = float(x), float(y)
+        self.vx, self.vy = 0.0, 0.0
+        self.angle       = float(angle)
+        self.color       = color
+        self.name        = name
+        self.hp          = 3
+        self.max_hp      = 5
+        self.score       = 0
+        self.thrusting   = False
+        self.cooldown    = 0.0
+        self.invincible  = 0.0
+        self.e_flame     = 0.0
+        self.effects: list[ActiveEffect] = []
+
+        # бот
+        self._bs          = "orbit"
+        self._bt          = 0.0
+        self._btarget_ang = float(angle)
+        self._bshoot_cd   = random.uniform(0.5, 2.0)
+        self._bpanic      = 0.0
+        self._phase       = 0.0
+        self._aim_cache   = (float(angle), 1e9)
+        self._aim_t       = 0.0
+        self._sim_target  = (x, y)
+
+    # ── эффекты ───────────────────────────────────────────────────────────────
+    def has_effect(self, name):
+        return any(e.name == name and e.active for e in self.effects)
+
+    def add_effect(self, name, dur, icon, color):
+        # заменяем если уже есть
+        for e in self.effects:
+            if e.name == name:
+                e.time_left = dur; e.active = True; return
+        self.effects.append(ActiveEffect(name, dur, icon, color))
+
+    def _update_effects(self, dt):
+        for e in self.effects: e.update(dt)
+        self.effects = [e for e in self.effects if e.active]
+
+    # ── физика ────────────────────────────────────────────────────────────────
+    def _gravity(self, planets, anomalies, dt):
+        for pl in planets:
+            dx=pl.x-self.x; dy=pl.y-self.y
+            dist=max(math.hypot(dx,dy), pl.r+14)
+            f=G*pl.mass*0.00015/(dist*dist)
+            self.vx+=dx/dist*f; self.vy+=dy/dist*f
+        for an in anomalies:
+            self.vx,self.vy = an.apply(self.vx,self.vy,self.x,self.y,dt)
+
+    def _move(self, dt):
+        self.vx *= 0.9985; self.vy *= 0.9985
+        spd = math.hypot(self.vx,self.vy)
+        if spd > MAX_SPD:
+            self.vx=self.vx/spd*MAX_SPD; self.vy=self.vy/spd*MAX_SPD
+        self.x=(self.x+self.vx*dt)%W; self.y=(self.y+self.vy*dt)%H
+
+    def _ticks(self, dt):
+        self.cooldown   = max(0.0, self.cooldown   - dt)
+        self.invincible = max(0.0, self.invincible - dt)
+        self.e_flame    = max(0.0, self.e_flame    - dt*4)
+        self._update_effects(dt)
+
+    def _effective_thrust(self):
+        return THRUST * (1.8 if self.has_effect("thrust") else 1.0)
+
+    # ── выстрел ───────────────────────────────────────────────────────────────
+    def _fire(self, bullets, rockets, enemies):
+        bx = self.x + math.cos(self.angle)*sv(24)
+        by = self.y + math.sin(self.angle)*sv(24)
+
+        def make_b(angle_off=0.0, piercing=False):
+            a = self.angle + angle_off
+            bullets.append(Bullet(bx, by,
+                math.cos(a) * BULLET_SPD,
+                math.sin(a) * BULLET_SPD,
+                id(self), piercing))
+
+        if self.has_effect("rocket"):
+            tgt = enemies[0] if enemies else None
+            rockets.append(Rocket(bx, by,
+                math.cos(self.angle) * BULLET_SPD * 0.8,
+                math.sin(self.angle) * BULLET_SPD * 0.8,
+                id(self)))
+            # снимаем эффект
+            self.effects = [e for e in self.effects if e.name != "rocket"]
+        elif self.has_effect("piercer"):
+            make_b(piercing=True)
+            self.effects = [e for e in self.effects if e.name != "piercer"]
+        elif self.has_effect("scatter"):
+            for a in [-0.45, -0.22, 0, 0.22, 0.45]:
+                make_b(a)
+        elif self.has_effect("triple"):
+            for a in [-0.18, 0, 0.18]:
+                make_b(a)
+        elif self.has_effect("twin"):
+            perp = self.angle + math.pi/2
+            for sign in [-1, 1]:
+                ox = math.cos(perp)*sv(8)*sign
+                oy = math.sin(perp)*sv(8)*sign
+                bullets.append(Bullet(bx+ox, by+oy,
+                    self.vx + math.cos(self.angle)*BULLET_SPD,
+                    self.vy + math.sin(self.angle)*BULLET_SPD,
+                    id(self)))
+        else:
+            make_b()
+
+        self.cooldown = 0.8
+
+    # ── pickup ────────────────────────────────────────────────────────────────
+    def apply_powerup(self, pu_type):
+        if   pu_type == "triple":  self.add_effect("triple",  4.0, "💛", QColor(255,220,60))
+        elif pu_type == "scatter": self.add_effect("scatter", 5.0, "🔵", QColor(60,160,255))
+        elif pu_type == "hp":
+            self.hp = min(self.hp+1, self.max_hp)
+        elif pu_type == "twin":    self.add_effect("twin",    5.0, "🟣", QColor(180,80,255))
+        elif pu_type == "shield":  self.add_effect("shield",  3.0, "🟢", QColor(60,220,120))
+        elif pu_type == "thrust":  self.add_effect("thrust",  5.0, "🟠", QColor(255,140,30))
+        elif pu_type == "piercer": self.add_effect("piercer", 3.0, "⭐", QColor(255,240,100))
+        elif pu_type == "rocket":  self.add_effect("rocket",  3.0, "🔴", QColor(255,60,20))
+
+    # ── управление игроком ────────────────────────────────────────────────────
+    def player_update(self, keys, rot_l, rot_r, thrust_k, shoot_k,
+                      planets, anomalies, bullets, rockets, emps, enemies, dt):
+        if rot_l    in keys: self.angle -= 2.8*dt
+        if rot_r    in keys: self.angle += 2.8*dt
+        if thrust_k in keys:
+            self.vx += math.cos(self.angle)*self._effective_thrust()*dt
+            self.vy += math.sin(self.angle)*self._effective_thrust()*dt
+            self.thrusting=True; self.e_flame=0.4
+        else:
+            self.thrusting=False
+        self._gravity(planets, anomalies, dt)
+        self._move(dt); self._ticks(dt)
+        jammed = any(e.jams(self.x,self.y) for e in emps)
+        if shoot_k in keys and self.cooldown<=0 and not jammed:
+            self._fire(bullets, rockets, enemies)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  УМНЫЙ БОТ  (параметризован профилем сложности)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _sim_bullet(self, angle, planets, steps):
+        bx  = self.x + math.cos(angle)*sv(24)
+        by  = self.y + math.sin(angle)*sv(24)
+        bvx = self.vx + math.cos(angle)*BULLET_SPD
+        bvy = self.vy + math.sin(angle)*BULLET_SPD
+        tx, ty = self._sim_target
+        min_d = 1e9; sdt = 0.05
+        for _ in range(steps):
+            for pl in planets:
+                dx=pl.x-bx; dy=pl.y-by
+                dist=max(math.hypot(dx,dy), pl.r+4)
+                f=G*pl.mass/(dist*dist)
+                bvx+=dx/dist*f*sdt; bvy+=dy/dist*f*sdt
+                if dist < pl.r+5: return 1e9, True
+            bx+=bvx*sdt; by+=bvy*sdt
+            d = math.hypot(bx-tx, by-ty)
+            if d<min_d: min_d=d
+            if not (-80<bx<W+80 and -80<by<H+80): break
+        return min_d, False
+
+    def _best_angle(self, target, planets, prof):
+        steps   = prof["sim_steps"]
+        samples = max(12, steps // 2)
+        best_d  = 1e9; best_ang = self.angle
+        for lead_t in (0.0, 0.55, 1.1):
+            px = target.x + target.vx*lead_t
+            py = target.y + target.vy*lead_t
+            self._sim_target = (px, py)
+            base   = math.atan2(py-self.y, px-self.x)
+            spread = math.pi/2
+            for i in range(samples):
+                a = base - spread + 2*spread*i/(samples-1)
+                d, hit = self._sim_bullet(a, planets, steps)
+                if not hit and d < best_d:
+                    best_d = d
+                    best_ang = a + random.uniform(-prof["aim_error"],
+                                                   prof["aim_error"])
+        return best_ang, best_d
+
+    def _incoming(self, bullets, prof):
+        for b in bullets:
+            if b.owner==id(self): continue
+            bx,by,bvx,bvy = b.x,b.y,b.vx,b.vy
+            for _ in range(20):
+                bx+=bvx*0.06; by+=bvy*0.06
+                if math.hypot(bx-self.x,by-self.y) < prof["evade_dist"]:
+                    return True
+        return False
+
+    def _near_planet(self, planets):
+        fx = self.x+self.vx*0.55; fy = self.y+self.vy*0.55
+        for pl in planets:
+            if math.hypot(fx-pl.x,fy-pl.y) < pl.r+sv(28): return pl
+        return None
+
+    def _tactical_angle(self, target):
+        tx,ty = target.x,target.y
+        dist  = math.hypot(self.x-tx,self.y-ty)
+        if dist < sv(180): return math.atan2(self.y-ty, self.x-tx)
+        if dist > sv(380): return math.atan2(ty-self.y, tx-self.x)
+        perp = math.atan2(ty-self.y,tx-self.x) + math.pi/2
+        return perp + math.sin(self._phase)*0.4
+
+    def bot_update(self, target, planets, anomalies, bullets, rockets, emps, dt,
+                   diff_name="Мастер"):
+        prof = DIFFICULTY[diff_name]
+        self._bt        -= dt
+        self._bshoot_cd -= dt
+        self._bpanic     = max(0.0, self._bpanic-dt)
+        self._phase     += dt*0.9
+        self._aim_t      = max(0.0, self._aim_t-dt)
+
+        tx,ty = target.x,target.y
+        dist_to_target = math.hypot(self.x-tx, self.y-ty)
+
+        if self._aim_t<=0:
+            best_ang, best_d = self._best_angle(target, planets, prof)
+            self._aim_cache  = (best_ang, best_d)
+            self._aim_t      = prof["react_t"] + random.uniform(0,0.12)
+
+        aim_angle, aim_dist = self._aim_cache
+        incoming   = self._incoming(bullets, prof)
+        bad_planet = self._near_planet(planets)
+        if incoming: self._bpanic = max(self._bpanic, 1.2)
+
+        if self._bt <= 0:
+            if self._bpanic > 0:
+                self._bs = "evade"; self._bt = random.uniform(0.35, 0.9)
+                threat = next((b for b in bullets if b.owner!=id(self)), None)
+                if threat:
+                    bdir = math.atan2(threat.vy, threat.vx)
+                    self._btarget_ang = bdir + math.pi/2*random.choice([-1,1])
+                else:
+                    self._btarget_ang = self.angle + math.pi*random.choice([-1,1])*0.7
+            elif bad_planet:
+                self._bs = "avoid"; self._bt = 0.5
+                self._btarget_ang = math.atan2(self.y-bad_planet.y, self.x-bad_planet.x)
+            elif dist_to_target < sv(150):
+                self._bs = "retreat"; self._bt = random.uniform(0.4, 0.8)
+                self._btarget_ang = math.atan2(self.y-ty, self.x-tx)
+            elif aim_dist < 45 and dist_to_target < sx(450):
+                self._bs = "aim"; self._bt = random.uniform(0.3, 0.7)
+                self._btarget_ang = aim_angle
+            elif dist_to_target > sv(380):
+                self._bs = "approach"; self._bt = random.uniform(0.5, 1.2)
+                self._btarget_ang = self._tactical_angle(target)
+            else:
+                self._bs = "orbit"; self._bt = random.uniform(0.5, 1.1)
+                self._btarget_ang = self._tactical_angle(target)
+
+        diff  = (self._btarget_ang-self.angle+math.pi)%(2*math.pi)-math.pi
+        tr    = prof["turn_rate"] * {"evade":1.3,"aim":1.5,"avoid":1.6}.get(self._bs,1.0)
+        self.angle += max(-tr*dt, min(tr*dt, diff))
+
+        tp = prof["thrust_p"]
+        if self._bs=="aim":    do_t = abs(diff)<0.3 and random.random()<tp*0.4
+        elif self._bs in("evade","avoid","retreat"): do_t = random.random()<tp*1.1
+        else:                  do_t = random.random()<tp
+        if do_t:
+            thrust = self._effective_thrust()
+            self.vx+=math.cos(self.angle)*thrust*dt
+            self.vy+=math.sin(self.angle)*thrust*dt
+            self.thrusting=True; self.e_flame=0.4
+        else:
+            self.thrusting=False
+
+        self._gravity(planets, anomalies, dt)
+        self._move(dt); self._ticks(dt)
+
+        jammed = any(e.jams(self.x,self.y) for e in emps)
+        if self._bshoot_cd<=0 and self.cooldown<=0 and not jammed:
+            if aim_dist < 55:
+                self.angle = aim_angle
+                self._fire(bullets, rockets, [target])
+                self._bshoot_cd = random.uniform(*[prof["shoot_min"],prof["shoot_max"]])
+            elif aim_dist < 140 and random.random()<0.35:
+                self.angle = aim_angle + random.uniform(-0.15,0.15)
+                self._fire(bullets, rockets, [target])
+                self._bshoot_cd = random.uniform(prof["shoot_min"],prof["shoot_max"])*1.4
+            else:
+                self._bshoot_cd = 0.2
+
+    # ── визуал ────────────────────────────────────────────────────────────────
+    def draw(self, p, is_bot=False):
+        p.save(); p.translate(int(self.x),int(self.y)); p.rotate(math.degrees(self.angle))
+        c = self.color
+
+        # щит
+        if self.has_effect("shield"):
+            p.setPen(QPen(QColor(60,220,120,160), sv(3)))
+            p.setBrush(QBrush(QColor(60,220,120,30)))
+            sr = sv(28)
+            p.drawEllipse(-sr,-sr,sr*2,sr*2)
+
+        # факел
+        if self.thrusting or self.e_flame>0:
+            inten = max(self.e_flame, 0.12 if self.thrusting else 0)
+            for radius in [sv(24),sv(15),sv(8)]:
+                a = int(110*inten*radius/sv(24))
+                p.setBrush(QBrush(QColor(255,140,30,a))); p.setPen(Qt.NoPen)
+                p.drawEllipse(-radius//2-sv(14),-radius//2,radius,radius)
+
+        # тень
+        p.setBrush(QBrush(QColor(0,0,0,50))); p.setPen(Qt.NoPen)
+        p.drawEllipse(-sv(18),sv(5),sv(36),sv(16))
+
+        # крылья
+        wc = QColor(200,40,40) if is_bot else c.darker(140)
+        p.setBrush(QBrush(wc)); p.setPen(Qt.NoPen)
+        wL = QPolygonF([QPointF(-sv(3),-sv(10)),QPointF(-sv(15),-sv(23)),QPointF(-sv(17),-sv(8))])
+        wR = QPolygonF([QPointF(-sv(3), sv(10)),QPointF(-sv(15), sv(23)),QPointF(-sv(17), sv(8))])
+        p.drawPolygon(wL); p.drawPolygon(wR)
+
+        # корпус
+        grad = QLinearGradient(-sv(16),-sv(9),sv(16),sv(9))
+        grad.setColorAt(0,c.lighter(200)); grad.setColorAt(0.45,c); grad.setColorAt(1,c.darker(200))
+        p.setBrush(QBrush(grad)); p.setPen(QPen(c.lighter(160),0.8))
+        hull = QPolygonF([QPointF(sv(20),0),QPointF(sv(7),-sv(8)),QPointF(-sv(9),-sv(11)),
+                          QPointF(-sv(15),-sv(5)),QPointF(-sv(15),sv(5)),
+                          QPointF(-sv(9),sv(11)),QPointF(sv(7),sv(8))])
+        p.drawPolygon(hull)
+        p.setBrush(QBrush(QColor(200,240,255,185))); p.setPen(Qt.NoPen)
+        p.drawEllipse(sv(5),-sv(5),sv(10),sv(10))
+        gc = QColor(200,50,50) if is_bot else c.darker(110)
+        p.setBrush(QBrush(gc)); p.drawRect(sv(14),-sv(2),sv(8),sv(4))
+        p.restore()
+
+        # ── HP кружки над кораблём ────────────────────────────────────────────
+        dot_r   = sv(5)
+        dot_gap = sv(12)
+        total_w = self.max_hp * dot_r*2 + (self.max_hp-1) * (dot_gap - dot_r*2)
+        dot_x0  = int(self.x - total_w/2)
+        dot_y   = int(self.y - sv(44))
+        for h in range(self.max_hp):
+            dx2 = dot_x0 + h * dot_gap
+            filled = (h < self.hp)
+            if filled:
+                # заполненный — цвет зависит от оставшегося HP
+                if h < 1 and self.hp == 1:
+                    dc = QColor(255, 50, 50)    # последнее — красное
+                elif self.hp <= 2:
+                    dc = QColor(255, 180, 0)    # мало — оранжевое
+                else:
+                    dc = QColor(80, 220, 80)    # норм — зелёное
+                p.setBrush(QBrush(dc))
+                p.setPen(QPen(dc.lighter(150), 1))
+            else:
+                # пустой — серый контур
+                p.setBrush(QBrush(QColor(40, 40, 60)))
+                p.setPen(QPen(QColor(100, 100, 120), 1))
+            p.drawEllipse(dx2, dot_y, dot_r*2, dot_r*2)
+
+        # активные эффекты (иконки) — под кружками HP
+        for i, ef in enumerate(self.effects):
+            ex = int(self.x - sv(15) + i*sv(17))
+            ey = int(self.y - sv(62))
+            frac = ef.time_left/ef.max_time
+            p.setBrush(QBrush(QColor(ef.color.red(),ef.color.green(),
+                                     ef.color.blue(), 160)))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(ex-sv(1), ey-sv(1), sv(15), sv(15), sv(3), sv(3))
+            p.setFont(QFont("Arial",fs(9)))
+            p.setPen(QColor(255,255,255))
+            p.drawText(ex, ey+sv(11), ef.icon)
+            # полоска таймера
+            p.setBrush(QBrush(ef.color)); p.setPen(Qt.NoPen)
+            p.drawRect(ex-sv(1), ey+sv(14), int(sv(15)*frac), sv(3))
+
+        # метка бота
+        if is_bot:
+            state_map = {
+                "aim":     ("🎯 AIM",   QColor(255,60,60)),
+                "evade":   ("💨 EVADE", QColor(60,200,255)),
+                "avoid":   ("🪐 AVOID", QColor(255,200,60)),
+                "retreat": ("⬅ BACK",  QColor(200,100,255)),
+                "approach":("→ CHASE", QColor(255,140,40)),
+                "orbit":   ("🔄 ORBIT", QColor(120,220,120)),
+            }
+            label, lc = state_map.get(getattr(self,"_bs","orbit"),
+                                      ("🤖 BOT",QColor(255,90,90)))
+            p.setFont(QFont("Arial",fs(9),QFont.Bold))
+            p.setPen(lc)
+            p.drawText(int(self.x-sv(22)), int(self.y-sv(72)), label)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЧАСТИЦА
+# ══════════════════════════════════════════════════════════════════════════════
+class Particle:
+    __slots__ = ("x","y","vx","vy","life","ml","color","r")
+    def __init__(self,x,y,color):
+        self.x,self.y=x,y
+        a=random.uniform(0,math.pi*2); sp=random.uniform(sv(40),sv(220))
+        self.vx,self.vy=math.cos(a)*sp,math.sin(a)*sp
+        self.ml=self.life=random.uniform(0.4,1.2)
+        self.color=color; self.r=random.uniform(sv(2),sv(7))
+    def update(self,dt):
+        self.x+=self.vx*dt; self.y+=self.vy*dt
+        self.vx*=0.97; self.vy*=0.97; self.life-=dt
+    def draw(self,p):
+        a=int(255*self.life/self.ml); r=int(self.r*self.life/self.ml)
+        if r<1: return
+        c=self.color
+        p.setBrush(QBrush(QColor(c.red(),c.green(),c.blue(),a))); p.setPen(Qt.NoPen)
+        p.drawEllipse(int(self.x-r),int(self.y-r),r*2,r*2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЗВЁЗДЫ (адаптивные)
+# ══════════════════════════════════════════════════════════════════════════════
+STAR_COUNT = int(140 * S * S)
+STARS = [(random.randint(0,W), random.randint(0,H),
+          random.randint(1,max(1,sv(3))), random.randint(35,200))
+         for _ in range(STAR_COUNT)]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ ПЛАНЕТ  (адаптивная)
+# ══════════════════════════════════════════════════════════════════════════════
+_PLANET_PALETTE = [
+    QColor(180,100,40), QColor(60,120,200), QColor(80,160,80),
+    QColor(160,80,180), QColor(200,160,60), QColor(60,140,160),
+    QColor(200,80,80),  QColor(80,200,160), QColor(160,160,60),
+]
+
+def _gen_planets(count):
+    """Расставляет count планет равномерно, избегая краёв и перекрытий.
+    Масса задаётся НЕЗАВИСИМО от радиуса — планеты разной гравитации."""
+    planets = []
+    margin  = sv(80)
+    # таблица масс: от карликовой до супермассивной
+    mass_variants = [0.15, 0.25, 0.40, 0.60, 0.80, 1.0, 1.3, 1.6, 2.0]
+    attempts = 0
+    i = 0
+    while i < count and attempts < 500:
+        attempts += 1
+        x = random.uniform(margin, W - margin)
+        y = random.uniform(margin, H - margin)
+        r = sv(random.randint(18, 58))
+        # масса НЕЗАВИСИМА от размера: маленькая но тяжёлая или большая но лёгкая
+        mass = random.choice(mass_variants)
+        if any(math.hypot(x-pl.x, y-pl.y) < r+pl.r+sv(60) for pl in planets):
+            continue
+        color = _PLANET_PALETTE[i % len(_PLANET_PALETTE)]
+        planets.append(Planet(x, y, r, mass, color))
+        i += 1
+    return planets
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ГЛАВНЫЙ ВИДЖЕТ
+# ══════════════════════════════════════════════════════════════════════════════
+class GravityWars(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Гравитационные войны")
+        self.resize(W, H)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self.keys        = set()
+        self.multiplayer = False
+        self.diff_idx    = 2           # 0=новобр, 1=опытный, 2=мастер
+        self.state       = "menu"
+        self.wins        = [0, 0]
+        self.planets     = _gen_planets(PLANET_COUNT)
+        self._init_round()
+
+        self.tmr = QTimer(self)
+        self.tmr.timeout.connect(self._tick)
+        self.tmr.start(16)
+
+    @property
+    def diff_name(self): return DIFF_NAMES[self.diff_idx]
+
+    # ── раунд ─────────────────────────────────────────────────────────────────
+    def _init_round(self):
+        c1 = QColor(0,180,255)
+        c2 = QColor(255,80,40) if not self.multiplayer else QColor(255,110,30)
+        self.sp = Ship(sx(110), H//2, c1, 0,       "P1")
+        self.se = Ship(W-sx(110), H//2, c2, math.pi,
+                       "BOT" if not self.multiplayer else "P2")
+        self.bullets   = []
+        self.rockets   = []
+        self.particles = []
+        self.asteroids = []
+        self.anomalies = []
+        self.emps      = []
+        self.powerups  = []
+        self._ast_t  = random.uniform(6,11)
+        self._anom_t = random.uniform(12,20)
+        self._emp_t  = random.uniform(18,28)
+        self._pu_t   = random.uniform(4,10)    # первый пауэрап
+        self._wave   = 1
+        self.round_over   = False
+        self.countdown    = 0
+        self.round_winner = -1
+
+    # ── клавиши ───────────────────────────────────────────────────────────────
+    def keyPressEvent(self, e):
+        self.keys.add(e.key())
+        k = e.key()
+        if k == Qt.Key_Escape: self.close()
+
+        if self.state == "menu":
+            if k == Qt.Key_1:
+                self.multiplayer=False; self.wins=[0,0]
+                self.planets=_gen_planets(PLANET_COUNT)
+                self._init_round(); self.state="game"
+            elif k == Qt.Key_2:
+                self.multiplayer=True; self.wins=[0,0]
+                self.planets=_gen_planets(PLANET_COUNT)
+                self._init_round(); self.state="game"
+            elif k == Qt.Key_L: self.state="leaderboard"
+            # сложность в меню: Tab / Shift+Tab
+            elif k == Qt.Key_Tab:
+                self.diff_idx = (self.diff_idx+1) % 3; self.update()
+            elif k == Qt.Key_Backtab:
+                self.diff_idx = (self.diff_idx-1) % 3; self.update()
+
+        elif self.state == "game":
+            if k == Qt.Key_R:
+                self.wins=[0,0]; self.planets=_gen_planets(PLANET_COUNT)
+                self._init_round()
+            if k == Qt.Key_L: self.state="leaderboard"
+            if k == Qt.Key_M: self.state="menu"
+
+        elif self.state in ("gameover","leaderboard"):
+            if k == Qt.Key_R:
+                self.wins=[0,0]; self.planets=_gen_planets(PLANET_COUNT)
+                self._init_round(); self.state="game"
+            if k == Qt.Key_M: self.state="menu"
+            if k == Qt.Key_L:
+                self.state="leaderboard" if self.state!="leaderboard" else "game"
+            if k == Qt.Key_S:
+                nm,ok = QInputDialog.getText(self,"Рекорд","Ваш ник:")
+                if ok and nm:
+                    md = ("2P" if self.multiplayer
+                          else f"1P vs BOT [{self.diff_name}]")
+
+    def keyReleaseEvent(self, e): self.keys.discard(e.key())
+
+    # ── тик ───────────────────────────────────────────────────────────────────
+    def _tick(self):
+        if self.state in ("menu","leaderboard"):
+            self.update(); return
+        if self.round_over:
+            self.countdown-=1
+            if self.countdown<=0: self._init_round()
+            self.update(); return
+
+        dt = 0.016
+        for pl in self.planets: pl.update(dt)
+
+        enemies_p = [self.se]; enemies_e = [self.sp]
+        self.sp.player_update(
+            self.keys, Qt.Key_A, Qt.Key_D, Qt.Key_W, Qt.Key_Space,
+            self.planets, self.anomalies, self.bullets, self.rockets,
+            self.emps, enemies_p, dt)
+        if self.multiplayer:
+            self.se.player_update(
+                self.keys, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Return,
+                self.planets, self.anomalies, self.bullets, self.rockets,
+                self.emps, enemies_e, dt)
+        else:
+            self.se.bot_update(
+                self.sp, self.planets, self.anomalies,
+                self.bullets, self.rockets, self.emps, dt, self.diff_name)
+
+        for b in self.bullets: b.update(self.planets, dt)
+        self.bullets = [b for b in self.bullets if b.alive]
+
+        # ракеты
+        target_map = {id(self.sp): self.se, id(self.se): self.sp}
+        for r in self.rockets:
+            tgt = target_map.get(r.owner)
+            r.update(self.planets, tgt, dt)
+        self.rockets = [r for r in self.rockets if r.alive]
+
+        self._spawn_hazards(dt)
+        for a in self.asteroids: a.update(self.planets, dt)
+        self.asteroids = [a for a in self.asteroids if a.alive]
+        self.anomalies = [a for a in self.anomalies if a.update(dt)]
+        self.emps      = [e for e in self.emps      if e.update(dt)]
+        for pu in self.powerups: pu.update(dt)
+        self.powerups  = [pu for pu in self.powerups if pu.alive]
+
+        for pt in self.particles: pt.update(dt)
+        self.particles = [pt for pt in self.particles if pt.life>0]
+
+        self._collisions()
+        self.update()
+
+    def _spawn_hazards(self, dt):
+        self._ast_t -= dt
+        if self._ast_t <= 0:
+            for _ in range(random.randint(1, 2+self._wave//2)):
+                self.asteroids.append(Asteroid(self._wave))
+            self._wave  = min(self._wave+1, 10)
+            self._ast_t = random.uniform(6,14)
+
+        self._pu_t -= dt
+        if self._pu_t<=0 and len(self.powerups)<4:
+            self.powerups.append(Powerup(self.planets))
+            self._pu_t = random.uniform(8,18)
+
+    # ── коллизии ─────────────────────────────────────────────────────────────
+    def _collisions(self):
+        ships = [(self.sp,0), (self.se,1)]
+
+        # снаряды → корабли
+        for b in self.bullets:
+            if not b.alive: continue
+            for ship,idx in ships:
+                if id(ship)!=b.owner and ship.invincible<=0:
+                    if math.hypot(b.x-ship.x, b.y-ship.y) < sv(17):
+                        if not ship.has_effect("shield"):
+                            ship.hp -= 1
+                        if not b.piercing: b.alive = False
+                        ship.invincible = 1.6
+                        self._boom(b.x, b.y, ship.color)
+                        if ship.hp<=0: self._end_round(1-idx)
+                        break
+
+        # ракеты → корабли
+        for r in self.rockets:
+            if not r.alive: continue
+            for ship,idx in ships:
+                if r.owner!=id(ship) and ship.invincible<=0:
+                    if math.hypot(r.x-ship.x, r.y-ship.y) < sv(20):
+                        if not ship.has_effect("shield"):
+                            ship.hp -= 2   # ракета наносит 2 урона
+                        r.alive = False
+                        ship.invincible = 1.8
+                        self._boom(r.x, r.y, QColor(255,80,30), n=28)
+                        if ship.hp<=0: self._end_round(1-idx)
+                        break
+
+        # астероиды → корабли
+        for ast in self.asteroids:
+            if not ast.alive: continue
+            for ship,idx in ships:
+                if ship.invincible<=0:
+                    if math.hypot(ast.x-ship.x, ast.y-ship.y) < ast.r+sv(16):
+                        if not ship.has_effect("shield"):
+                            ship.hp -= 1
+                        ship.invincible = 1.2
+                        ast.alive = False
+                        self._boom(ast.x, ast.y, QColor(200,150,80))
+                        if ship.hp<=0: self._end_round(1-idx)
+                        break
+
+        # снаряды → астероиды
+        for b in self.bullets:
+            if not b.alive: continue
+            for ast in self.asteroids:
+                if ast.alive and math.hypot(b.x-ast.x,b.y-ast.y)<ast.r+sv(5):
+                    ast.hp -= 1
+                    if not b.piercing: b.alive=False
+                    if ast.hp<=0:
+                        self._boom(ast.x,ast.y,ast.color,n=14); ast.alive=False
+                        (self.sp if b.owner==id(self.sp) else self.se).score += 5
+                    break
+
+        # корабли → пауэрапы
+        for pu in self.powerups:
+            if not pu.alive: continue
+            for ship,idx in ships:
+                if math.hypot(pu.x-ship.x, pu.y-ship.y) < pu.r+sv(16):
+                    ship.apply_powerup(pu.type)
+                    pu.alive = False
+                    self._boom(pu.x, pu.y, pu.color, n=12)
+                    break
+
+    def _end_round(self, winner_idx):
+        self.wins[winner_idx] += 1
+        self.round_winner = winner_idx
+        self.round_over   = True
+        self.countdown    = 170
+        loser = self.se if winner_idx==0 else self.sp
+        self._boom(loser.x, loser.y, loser.color, n=40)
+
+    def _boom(self, x, y, color, n=18):
+        for _ in range(n): self.particles.append(Particle(x,y,color))
+
+    # ── paint ─────────────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self.state=="menu":        self._draw_menu(p); return
+        if self.state=="leaderboard": self._draw_lb(p);   return
+
+        p.fillRect(0,0,W,H,QColor(3,3,16))
+        for sx2,sy2,sr,sa in STARS:
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(QColor(255,255,255,sa)))
+            p.drawEllipse(sx2,sy2,sr,sr)
+
+        for an in self.anomalies: an.draw(p)
+        for em in self.emps:      em.draw(p)
+        for pl in self.planets:   pl.draw(p)
+        for pu in self.powerups:  pu.draw(p)
+        for ast in self.asteroids: ast.draw(p)
+        for b in self.bullets:
+            bc = self.sp.color if b.owner==id(self.sp) else self.se.color
+            b.draw(p,bc)
+        for r in self.rockets: r.draw(p)
+
+        for ship,bot_flag in [(self.sp,False),(self.se,not self.multiplayer)]:
+            if ship.invincible>0 and int(ship.invincible*10)%2==0: continue
+            ship.draw(p,bot_flag)
+
+        for pt in self.particles: pt.draw(p)
+        self._draw_hud(p)
+
+        if self.round_over:
+            p.fillRect(0,0,W,H,QColor(0,0,0,150))
+            p.setFont(QFont("Arial",fs(44),QFont.Bold))
+            p.setPen(QColor(255,220,60))
+            wn = "P1" if self.round_winner==0 else ("BOT" if not self.multiplayer else "P2")
+            p.drawText(0,0,W,H,Qt.AlignCenter,f"Раунд — {wn}!")
+
+    def _draw_hud(self, p):
+        jp = any(e.jams(self.sp.x,self.sp.y) for e in self.emps)
+        je = any(e.jams(self.se.x,self.se.y) for e in self.emps)
+        for i,(ship,jammed) in enumerate([(self.sp,jp),(self.se,je)]):
+            x = sx(12) if i==0 else W-sx(280)
+            jm = "  ⚡ЭМИ!" if jammed else ""
+            p.setFont(QFont("Arial",fs(14),QFont.Bold))
+            p.setPen(ship.color)
+            p.drawText(x,sy(30),f"{ship.name}  ★{self.wins[i]}  💥{ship.score}{jm}")
+
+        if not self.multiplayer:
+            dc = DIFFICULTY[self.diff_name]["label_color"]
+            p.setFont(QFont("Arial",fs(10),QFont.Bold))
+            p.setPen(dc)
+            p.drawText(0,0,W,sy(22),Qt.AlignHCenter,
+                       f"Волна: {self._wave}   ⚙ {self.diff_name}")
+        else:
+            p.setFont(QFont("Arial",fs(10)))
+            p.setPen(QColor(160,140,200))
+            p.drawText(0,0,W,sy(22),Qt.AlignHCenter,f"Волна: {self._wave}")
+
+        p.setFont(QFont("Arial",fs(8)))
+        p.setPen(QColor(90,90,130))
+        hint = ("WASD+Пробел  |  BOT:авто  |  R-рестарт  L-рекорды  M-меню"
+                if not self.multiplayer else
+                "P1:WASD+Пробел  |  P2:Стрелки+Enter  |  R L M")
+        p.drawText(sx(10),H-sy(9),hint)
+
+    # ── меню ──────────────────────────────────────────────────────────────────
+    def _draw_menu(self, p):
+        p.fillRect(0,0,W,H,QColor(3,3,16))
+        for sx2,sy2,sr,sa in STARS:
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(QColor(255,255,255,sa)))
+            p.drawEllipse(sx2,sy2,sr,sr)
+
+        p.setFont(QFont("Arial",fs(46),QFont.Bold))
+        p.setPen(QColor(0,180,255))
+        p.drawText(0,sy(60),W,sy(75),Qt.AlignCenter,"ГРАВИТАЦИОННЫЕ ВОЙНЫ")
+
+        p.setFont(QFont("Arial",fs(12)))
+        p.setPen(QColor(120,120,180))
+
+        # ── выбор сложности ──
+        diff_y = sy(178)
+        p.setFont(QFont("Arial",fs(13),QFont.Bold))
+        p.setPen(QColor(200,200,200))
+        p.drawText(0,diff_y,W,sy(26),Qt.AlignCenter,"Сложность бота:  Tab / Shift+Tab")
+        diff_y += sy(30)
+        box_w = sx(150); box_h = sy(38); gap = sx(18)
+        total_w = 3*box_w + 2*gap
+        start_x = (W - total_w) // 2
+        for i, name in enumerate(DIFF_NAMES):
+            bx2 = start_x + i*(box_w+gap)
+            selected = (i == self.diff_idx)
+            dc = DIFFICULTY[name]["label_color"]
+            if selected:
+                p.setBrush(QBrush(QColor(dc.red(),dc.green(),dc.blue(),60)))
+                p.setPen(QPen(dc, sv(2)))
+            else:
+                p.setBrush(QBrush(QColor(40,40,60)))
+                p.setPen(QPen(QColor(80,80,100),1))
+            p.drawRoundedRect(bx2,diff_y,box_w,box_h,sv(6),sv(6))
+            p.setFont(QFont("Arial",fs(13),QFont.Bold if selected else QFont.Normal))
+            p.setPen(dc if selected else QColor(160,160,180))
+            p.drawText(bx2,diff_y,box_w,box_h,Qt.AlignCenter,name)
+        diff_y += box_h + sy(14)
+
+        items = [
+            (QColor(80,220,80),  f"1  —  Одиночный  (vs BOT [{self.diff_name}])"),
+            (QColor(255,160,60), "2  —  Два игрока   (WASD  vs  Стрелки)"),
+            (QColor(140,140,160),"Esc — Выход"),
+        ]
+        p.setFont(QFont("Arial",fs(18)))
+        for i,(col,text) in enumerate(items):
+            p.setPen(col)
+            p.drawText(0,diff_y+i*sy(56),W,sy(48),Qt.AlignCenter,text)
+
+        # пауэрап-легенда
+        legend_y = H - sy(58)
+        p.setFont(QFont("Arial",fs(10),QFont.Bold))
+        p.setPen(QColor(160,140,200))
+        p.drawText(0,legend_y,W,sy(20),Qt.AlignCenter,
+                   "Пауэрапы:  💛Тройн  🔵Рассеян  ❤+HP  🟣Спарен  🟢Щит  🟠Ускор  ⭐Пробойник  🔴Ракета")
+        p.setFont(QFont("Arial",fs(9)))
+        p.setPen(QColor(70,70,110))
+        p.drawText(0,legend_y+sy(22),W,sy(20),Qt.AlignCenter,
+                   f"Экран: {W}×{H}   Планет: {PLANET_COUNT}   Масштаб: {S:.2f}×")
+
+if __name__ == "__main__":
+    app = _app_ref
+    w   = GravityWars()
+    w.show()
+    sys.exit(app.exec_())
